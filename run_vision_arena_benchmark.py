@@ -39,12 +39,12 @@ class VisionArenaBenchmark:
         self.results_dir.mkdir(exist_ok=True)
         
         # Default API server counts to test
-        self.api_server_counts = [1, 2, 4, 8]
+        self.api_server_counts = [2, 4, 8]
         
         # Default request rates (QPS) to test
-        self.request_rates = [1, 4, 8, 16, "inf"]
+        self.request_rates = [8, 16]
         
-    def wait_for_server(self, port: int, timeout: int = 300) -> bool:
+    def wait_for_server(self, port: int, timeout: int = 1200) -> bool:
         """Wait for vLLM server to be ready"""
         import requests
         
@@ -82,12 +82,7 @@ class VisionArenaBenchmark:
         server_args = [
             "vllm", "serve", self.model,
             "--port", str(self.base_port),
-            "--api-server-count", str(api_server_count),
-            "--disable-log-requests",
-            "--disable-log-stats",
-            "--gpu-memory-utilization", "0.9",
-            "--max-model-len", "8192",
-            "--trust-remote-code",
+            "--api-server-count", str(api_server_count)
         ]
         
         # Add V1 engine if using multiple API servers
@@ -108,6 +103,13 @@ class VisionArenaBenchmark:
         
         # Wait for server to be ready
         if not self.wait_for_server(self.base_port):
+            # Get error output before terminating
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+                print(f"Server stdout: {stdout[-1000:]}")  # Last 1000 chars
+                print(f"Server stderr: {stderr[-1000:]}")  # Last 1000 chars
+            except:
+                pass
             process.terminate()
             raise RuntimeError("Failed to start server")
         
@@ -184,6 +186,7 @@ class VisionArenaBenchmark:
             # Kill any existing processes
             self.kill_vllm_processes()
             
+            server_process = None
             try:
                 # Start server
                 server_process = self.start_server(api_server_count)
@@ -209,17 +212,113 @@ class VisionArenaBenchmark:
             
             finally:
                 # Clean up server process
-                try:
-                    server_process.terminate()
-                    server_process.wait(timeout=10)
-                except:
-                    server_process.kill()
+                if server_process is not None:
+                    try:
+                        server_process.terminate()
+                        server_process.wait(timeout=10)
+                    except:
+                        try:
+                            server_process.kill()
+                        except:
+                            pass
                 
                 self.kill_vllm_processes()
                 time.sleep(5)  # Wait between tests
         
         return results
     
+    def save_consolidated_results(self, results: Dict) -> str:
+        """Save all benchmark results to a single consolidated JSON file"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = self.results_dir / f"consolidated_benchmark_results_{timestamp}.json"
+        
+        # Create consolidated structure
+        consolidated = {
+            "benchmark_info": {
+                "model": self.model,
+                "dataset": self.dataset_path,
+                "num_prompts": self.num_prompts,
+                "timestamp": timestamp,
+                "api_server_counts_tested": self.api_server_counts,
+                "request_rates_tested": self.request_rates,
+                "total_configurations": sum(len(api_results) for api_results in results.values())
+            },
+            "results_by_api_server_count": results,
+            "summary": {
+                "best_performance": {
+                    "request_throughput": {"api_server_count": 0, "request_rate": 0, "value": 0, "unit": "requests/sec"},
+                    "token_throughput": {"api_server_count": 0, "request_rate": 0, "value": 0, "unit": "tokens/sec"},
+                    "lowest_ttft": {"api_server_count": 0, "request_rate": 0, "value": float('inf'), "unit": "ms"},
+                    "lowest_tpot": {"api_server_count": 0, "request_rate": 0, "value": float('inf'), "unit": "ms"}
+                },
+                "performance_comparison": []
+            }
+        }
+        
+        # Process each result to find best performance
+        for api_count, api_results in results.items():
+            for request_rate, data in api_results.items():
+                if not data:
+                    continue
+                    
+                # Extract metrics safely
+                req_throughput = data.get('request_throughput', 0)
+                token_throughput = data.get('output_throughput', 0)
+                ttft = data.get('mean_ttft_ms', float('inf'))
+                tpot = data.get('mean_tpot_ms', float('inf'))
+                
+                # Add to comparison data
+                consolidated["summary"]["performance_comparison"].append({
+                    "api_server_count": api_count,
+                    "request_rate": request_rate,
+                    "request_throughput": req_throughput,
+                    "token_throughput": token_throughput,
+                    "mean_ttft_ms": ttft,
+                    "mean_tpot_ms": tpot
+                })
+                
+                # Update best metrics
+                if req_throughput > consolidated["summary"]["best_performance"]["request_throughput"]["value"]:
+                    consolidated["summary"]["best_performance"]["request_throughput"].update({
+                        "api_server_count": api_count,
+                        "request_rate": request_rate,
+                        "value": req_throughput
+                    })
+                
+                if token_throughput > consolidated["summary"]["best_performance"]["token_throughput"]["value"]:
+                    consolidated["summary"]["best_performance"]["token_throughput"].update({
+                        "api_server_count": api_count,
+                        "request_rate": request_rate,
+                        "value": token_throughput
+                    })
+                
+                if ttft < consolidated["summary"]["best_performance"]["lowest_ttft"]["value"]:
+                    consolidated["summary"]["best_performance"]["lowest_ttft"].update({
+                        "api_server_count": api_count,
+                        "request_rate": request_rate,
+                        "value": ttft
+                    })
+                
+                if tpot < consolidated["summary"]["best_performance"]["lowest_tpot"]["value"]:
+                    consolidated["summary"]["best_performance"]["lowest_tpot"].update({
+                        "api_server_count": api_count,
+                        "request_rate": request_rate,
+                        "value": tpot
+                    })
+        
+        # Sort performance comparison by request throughput (descending)
+        consolidated["summary"]["performance_comparison"].sort(
+            key=lambda x: x.get("request_throughput", 0), reverse=True
+        )
+        
+        # Save consolidated results
+        os.makedirs(self.results_dir, exist_ok=True)
+        with open(filename, 'w') as f:
+            json.dump(consolidated, f, indent=2)
+        
+        print(f"\n🎉 Consolidated results saved to: {filename}")
+        return str(filename)
+
     def generate_report(self, results: Dict) -> str:
         """Generate a comprehensive report from benchmark results"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -347,10 +446,19 @@ def main():
     # Run benchmarks
     results = benchmark.run_all_benchmarks()
     
+    # Save consolidated results to single file
+    consolidated_file = benchmark.save_consolidated_results(results)
+    
     # Generate report
     report = benchmark.generate_report(results)
+    
     print("\n" + "="*60)
     print("BENCHMARK COMPLETED")
+    print("="*60)
+    print(f"📊 Consolidated results: {consolidated_file}")
+    print(f"📋 Detailed report: {benchmark.results_dir}/vision_arena_report_*.md")
+    print("\n" + "="*60)
+    print("SUMMARY")
     print("="*60)
     print(report[:1000] + "..." if len(report) > 1000 else report)
 
