@@ -401,14 +401,14 @@ def main():
         "--api-server-counts",
         type=int,
         nargs="+",
-        default=[1, 2, 4, 8],
-        help="API server counts to test (default: [1, 2, 4, 8])"
+        default=[2, 4, 8],
+        help="API server counts to test (default: [2, 4, 8])"
     )
     parser.add_argument(
         "--request-rates",
         nargs="+",
-        default=[1, 4, 8, 16, "inf"],
-        help="Request rates to test (default: [1, 4, 8, 16, inf])"
+        default=[8, 16],
+        help="Request rates to test (default: [8, 16])"
     )
     parser.add_argument(
         "--base-port",
